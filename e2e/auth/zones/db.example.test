@@ -1,0 +1,21 @@
+$TTL 3600
+$ORIGIN example.test.
+@		IN SOA	ns1.example.test. hostmaster.example.test. ( 2026082801 3600 900 604800 300 )
+@		IN NS	ns1.example.test.
+ns1		IN A	172.30.0.10
+test		IN A	10.0.0.1
+test0		IN A	10.0.0.10
+test1		IN A	10.0.0.11
+test2		IN A	10.0.0.12
+test3		IN A	10.0.0.13
+test4		IN A	10.0.0.14
+test5		IN A	10.0.0.15
+test6		IN A	10.0.0.16
+test7		IN A	10.0.0.17
+test8		IN A	10.0.0.18
+test9		IN A	10.0.0.19
+multi		IN A	10.0.1.1
+multi		IN A	10.0.1.2
+multi		IN A	10.0.1.3
+multi		IN AAAA	2001:db8::1
+multi		IN TXT	"a fairly long TXT record so that ANY-style answers with several RRSIGs get big quickly"

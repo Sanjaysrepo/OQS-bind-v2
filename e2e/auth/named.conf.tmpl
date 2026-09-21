@@ -1,0 +1,40 @@
+options {
+	directory "/var/cache/bind";
+	listen-on { any; };
+	listen-on-v6 { none; };
+	recursion no;
+	allow-query { any; };
+	dnssec-validation no;
+	edns-udp-size 1232;
+	max-udp-size 1232;
+	minimal-responses no;
+	@FRAG@
+};
+
+logging {
+	channel stderr_chan {
+		stderr;
+		severity dynamic;
+		print-category yes;
+		print-severity yes;
+		print-time yes;
+	};
+	category default { stderr_chan; };
+	category UDP-fragmentation { stderr_chan; };
+	category queries { stderr_chan; };
+};
+
+zone "." {
+	type primary;
+	file "db.root.signed";
+};
+
+zone "test" {
+	type primary;
+	file "db.test.signed";
+};
+
+zone "example.test" {
+	type primary;
+	file "db.example.test.signed";
+};

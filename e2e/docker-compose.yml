@@ -1,0 +1,53 @@
+# End-to-end test bed for UDP fragmentation (see run_tests.sh).
+#
+#   auth     172.30.0.10  authoritative for ".", "test." and "example.test.",
+#                         all DNSSEC-signed with a PQC algorithm ($ALG)
+#   resolver 172.30.0.20  validating recursive resolver, root hints -> auth
+#
+# Both run named with `udp-fragmentation $UDP_FRAGMENTATION;` (RAW or QBF).
+services:
+  auth:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      args:
+        DEPS_IMAGE: ${DEPS_IMAGE:-oqs-bind-deps}
+    image: oqs-bind:e2e
+    container_name: oqs-auth
+    environment:
+      ROLE: auth
+      ALG: ${ALG:-P256_FALCON512}
+      UDP_FRAGMENTATION: ${AUTH_FRAG:-${UDP_FRAGMENTATION:-RAW}}
+      DEBUG_LEVEL: ${DEBUG_LEVEL:-3}
+    cap_add: [NET_ADMIN, NET_RAW]
+    volumes:
+      - .:/src/e2e:ro
+      - shared:/shared
+      - ./captures:/captures
+    networks:
+      oqs:
+        ipv4_address: 172.30.0.10
+  resolver:
+    image: oqs-bind:e2e
+    container_name: oqs-resolver
+    depends_on: [auth]
+    environment:
+      ROLE: resolver
+      UDP_FRAGMENTATION: ${RESOLVER_FRAG:-${UDP_FRAGMENTATION:-RAW}}
+      DNSSEC_VALIDATION: ${DNSSEC_VALIDATION:-yes}
+      DEBUG_LEVEL: ${DEBUG_LEVEL:-3}
+    cap_add: [NET_ADMIN, NET_RAW]
+    volumes:
+      - .:/src/e2e:ro
+      - shared:/shared
+      - ./captures:/captures
+    networks:
+      oqs:
+        ipv4_address: 172.30.0.20
+networks:
+  oqs:
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+volumes:
+  shared:

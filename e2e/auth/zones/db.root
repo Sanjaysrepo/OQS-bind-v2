@@ -1,0 +1,7 @@
+$TTL 3600
+$ORIGIN .
+@		IN SOA	ns1. hostmaster. ( 2026082801 3600 900 604800 300 )
+@		IN NS	ns1.
+ns1.		IN A	172.30.0.10
+test.		IN NS	ns1.test.
+ns1.test.	IN A	172.30.0.10

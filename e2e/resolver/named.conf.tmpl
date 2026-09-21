@@ -1,0 +1,33 @@
+options {
+	directory "/var/cache/bind";
+	listen-on { any; };
+	listen-on-v6 { none; };
+	recursion yes;
+	allow-query { any; };
+	allow-recursion { any; };
+	dnssec-validation @VALIDATION@;
+	edns-udp-size 1232;
+	max-udp-size 1232;
+	qname-minimization off;
+	@COOKIE@
+	@FRAG@
+};
+
+logging {
+	channel stderr_chan {
+		stderr;
+		severity dynamic;
+		print-category yes;
+		print-severity yes;
+		print-time yes;
+	};
+	category default { stderr_chan; };
+	category UDP-fragmentation { stderr_chan; };
+	category resolver { stderr_chan; };
+	category dnssec { stderr_chan; };
+};
+
+zone "." {
+	type hint;
+	file "root.hints";
+};

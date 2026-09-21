@@ -1,0 +1,5 @@
+;
+; badcache
+;
+; example.com/A [ttl 60]
+; example.com/AAAA [ttl 60]
