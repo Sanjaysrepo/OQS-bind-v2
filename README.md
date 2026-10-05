@@ -86,11 +86,15 @@ keys, hybrid keys) and needs no changes to the resource records.  In RAW
 mode the resolver also runs in **1-RTT mode**: alongside a query that may
 get a fragmented answer (EDNS with DO set) it sends speculative fragment
 requests - as many as the last fragmented reply of that server needed
-(per-server history, default and cap 4) - so the complete answer arrives
-in a single round trip.  A server that does not fragment, or an answer
-that needs no fragmentation, answers them with OPCODE 7 error echoes
-that the resolver ignores; an answer with more fragments than estimated
-has the remainder requested when fragment 0 arrives (two-step).  A
+(history per server and query type; default 4 for unknown servers, and
+never fewer than 4) - so the complete answer arrives in a single round
+trip.  A server that does not fragment, or an answer that needs no
+fragmentation, answers them with OPCODE 7 error echoes that the resolver
+ignores; an answer with more fragments than estimated has the remainder
+requested when fragment 0 arrives (two-step); and requests that reach
+the server before its answer exists (a recursive server still
+resolving) are detected from the echoes and sent again.  `dig` does the
+same, so `dig +dnssec` shows 1-RTT behaviour too.  A
 resolver that does not understand RAW sees RCODE 12 and treats the reply
 as an error rather than caching an empty answer; clients without EDNS get
 the usual truncated (TC) reply and retry over TCP.  The full wire format

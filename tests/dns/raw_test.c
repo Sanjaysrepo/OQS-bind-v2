@@ -356,11 +356,70 @@ ISC_RUN_TEST_IMPL(raw_prefetch_candidate_check) {
 	assert_false(raw_prefetch_candidate(&r));
 }
 
+/* the byte-level builder must produce exactly what the renderer produces */
+ISC_RUN_TEST_IMPL(raw_build_request_check) {
+	unsigned char q[] = { 0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 1,
+			      /* question: test.example.test. A IN */
+			      4, 't', 'e', 's', 't', 7, 'e', 'x', 'a', 'm', 'p',
+			      'l', 'e', 4, 't', 'e', 's', 't', 0, 0, 1, 0, 1,
+			      /* OPT: root, type 41, class 1232, ttl DO, rdlen 0 */
+			      0, 0, 41, 0x04, 0xd0, 0, 0, 0x80, 0, 0, 0 };
+	isc_region_t r = { .base = q, .length = sizeof(q) };
+	isc_buffer_t qbuf;
+
+	for (unsigned total = 2; total <= RAW_MAX_FRAGMENTS; total += 7) {
+		for (unsigned nr = 0; nr < total; nr++) {
+			isc_buffer_t *fast = NULL, *slow = NULL;
+
+			assert_int_equal(raw_build_request(mctx, &r, nr, total,
+							   &fast),
+					 ISC_R_SUCCESS);
+			isc_buffer_init(&qbuf, q, sizeof(q));
+			isc_buffer_add(&qbuf, sizeof(q));
+			assert_int_equal(create_fragment_query_opt(mctx, &qbuf,
+								   nr, total,
+								   &slow),
+					 ISC_R_SUCCESS);
+			assert_int_equal(isc_buffer_usedlength(fast),
+					 isc_buffer_usedlength(slow));
+			assert_memory_equal(isc_buffer_base(fast),
+					    isc_buffer_base(slow),
+					    isc_buffer_usedlength(fast));
+			isc_buffer_free(&fast);
+			isc_buffer_free(&slow);
+		}
+	}
+
+	isc_buffer_t *bad = NULL;
+	assert_int_equal(raw_build_request(mctx, &r, 5, 5, &bad),
+			 ISC_R_FAILURE);
+	assert_int_equal(raw_build_request(mctx, &r, 0, 64, &bad),
+			 ISC_R_FAILURE);
+	r.length = 20; /* question cut short */
+	assert_int_equal(raw_build_request(mctx, &r, 1, 3, &bad),
+			 ISC_R_UNEXPECTEDEND);
+	assert_null(bad);
+
+	r.length = sizeof(q);
+	assert_int_equal(raw_question_type(&r), 1); /* A */
+	r.length = 20;
+	assert_int_equal(raw_question_type(&r), 0);
+
+	/* requests 1..3 sent: which echoes mean a request was lost */
+	assert_false(raw_prefetch_missed(3, 3, 1)); /* 3 is beyond 0..2 */
+	assert_true(raw_prefetch_missed(3, 3, 2));
+	assert_false(raw_prefetch_missed(3, 7, 0)); /* all needed, no echo */
+	assert_true(raw_prefetch_missed(3, 7, 1));
+	assert_false(raw_prefetch_missed(3, 1, 3)); /* answer not fragmented */
+	assert_false(raw_prefetch_missed(0, 5, 0));
+}
+
 ISC_TEST_LIST_START
 ISC_TEST_ENTRY_CUSTOM(raw_fragment_and_reassemble, setup_loopmgr,
 		      teardown_loopmgr)
 ISC_TEST_ENTRY(raw_parse_envelope_garbage)
 ISC_TEST_ENTRY(raw_prefetch_candidate_check)
+ISC_TEST_ENTRY(raw_build_request_check)
 ISC_TEST_LIST_END
 
 ISC_TEST_MAIN

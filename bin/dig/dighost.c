@@ -3115,14 +3115,108 @@ print_query_size(dig_query_t *query) {
 	}
 }
 
+/*
+ * Sends a RAW fragment request on the query's socket (so the fragment
+ * comes back to the same port); takes ownership of *requestp.
+ */
+static void
+raw_send_request(dig_query_t *query, isc_buffer_t **requestp) {
+	raw_fragment_send_ctx_t *ctx = isc_mem_get(mctx, sizeof(*ctx));
+	isc_region_t rr;
+
+	*ctx = (raw_fragment_send_ctx_t){ .buffer = *requestp };
+	*requestp = NULL;
+	query_attach(query, &ctx->query);
+	isc_nmhandle_attach(query->handle, &ctx->sendhandle);
+	isc_buffer_usedregion(ctx->buffer, &rr);
+
+	isc_refcount_increment0(&sendcount);
+	debug("sendcount=%" PRIuFAST32, isc_refcount_current(&sendcount));
+	isc_nm_send(query->handle, &rr, raw_fragment_send_done, ctx);
+}
+
+/*
+ * RAW 1-RTT: speculative requests that reached the server before the
+ * answer existed (e.g. a recursive server still resolving) come back as
+ * echoes; once the answer's size is known, request again every fragment
+ * among them that has not arrived (see raw_prefetch_missed()).
+ */
+static void
+raw_rerequest_missed(dig_query_t *query, const unsigned char *key,
+		     unsigned keysize) {
+	unsigned int nr = query->raw_nr;
+	isc_buffer_t *have = NULL;
+	isc_region_t r;
+
+	if (query->raw_rerequested || nr == 0 ||
+	    !raw_prefetch_missed(query->raw_prefetched, nr, query->raw_echoes))
+	{
+		return;
+	}
+	query->raw_rerequested = true;
+
+	for (unsigned int j = 0; j < nr && have == NULL; j++) {
+		(void)fcache_get_fragment(dig_fcache, key, keysize, j, &have);
+	}
+	if (have == NULL) {
+		return;
+	}
+	isc_buffer_usedregion(have, &r);
+
+	for (unsigned int i = 1; i <= query->raw_prefetched && i < nr; i++) {
+		isc_buffer_t *present = NULL, *request = NULL;
+		if (fcache_get_fragment(dig_fcache, key, keysize, i,
+					&present) == ISC_R_SUCCESS)
+		{
+			continue;
+		}
+		if (raw_build_request(mctx, &r, i, nr, &request) !=
+		    ISC_R_SUCCESS)
+		{
+			break;
+		}
+		debug("RAW 1-RTT: requesting fragment %u of %u again", i, nr);
+		raw_send_request(query, &request);
+	}
+}
+
 static void
 send_udp(dig_query_t *query) {
 	dig_query_t *sendquery = NULL;
 	isc_region_t r;
+	isc_buffer_t *prefetch[RAW_1RTT_DEFAULT_ESTIMATE] = { NULL };
+	unsigned int nprefetch = 0;
 
 	query_attach(query, &sendquery);
 
 	isc_buffer_usedregion(&query->sendbuf, &r);
+
+	/*
+	 * RAW 1-RTT: a query whose answer may be fragmented (EDNS + DO) is
+	 * followed straight away by requests for fragments 1..3, so the
+	 * complete answer arrives in one round trip.  dig keeps no history,
+	 * so the default estimate is used.  A server or an answer that does
+	 * not fragment answers them with OPCODE 7 error echoes, which
+	 * recv_done() ignores.  Built before the query is sent, so the
+	 * query and its requests leave back to back.
+	 */
+	query->raw_prefetched = 0;
+	query->raw_nr = 0;
+	query->raw_echoes = 0;
+	query->raw_rerequested = false;
+	if (raw_prefetch_candidate(&r)) {
+		for (unsigned int i = 1; i < RAW_1RTT_DEFAULT_ESTIMATE; i++) {
+			if (raw_build_request(mctx, &r, i,
+					      RAW_1RTT_DEFAULT_ESTIMATE,
+					      &prefetch[nprefetch]) !=
+			    ISC_R_SUCCESS)
+			{
+				break;
+			}
+			nprefetch++;
+		}
+	}
+
 	debug("sending a request");
 	if (query->lookup->use_usec) {
 		query->time_sent = isc_time_now_hires();
@@ -3135,6 +3229,15 @@ send_udp(dig_query_t *query) {
 	isc_nm_send(query->handle, &r, send_done, sendquery);
 	isc_refcount_increment0(&sendcount);
 	debug("sendcount=%" PRIuFAST32, isc_refcount_current(&sendcount));
+
+	for (unsigned int i = 0; i < nprefetch; i++) {
+		raw_send_request(query, &prefetch[i]);
+	}
+	query->raw_prefetched = nprefetch;
+	if (nprefetch > 0) {
+		debug("RAW 1-RTT: sent %u speculative fragment requests",
+		      nprefetch);
+	}
 
 	/* XXX qrflag, print_query, etc... */
 	if (query->lookup->qr) {
@@ -4157,6 +4260,30 @@ recv_done(isc_nmhandle_t *handle, isc_result_t eresult, isc_region_t *region,
 		goto keep_query;
 	}
 
+	/*
+	 * RAW 1-RTT: an OPCODE 7 reply that is not a fragment is the echo of
+	 * a speculative fragment request the answer turned out not to need
+	 * (or that the server does not support).  Not the answer - keep
+	 * waiting for it.
+	 */
+	if (!l->tcp_mode && region->length >= 12 &&
+	    ((region->base[2] >> 3) & 0x0F) == RAW_OPCODE &&
+	    !raw_is_fragment(region))
+	{
+		unsigned char key[69];
+		unsigned keysize = sizeof(key);
+
+		debug("RAW: ignoring OPCODE 7 echo of a speculative request");
+		query->raw_echoes++;
+		fcache_create_key(id, local_addr_buf, key, &keysize);
+		raw_rerequest_missed(query, key, keysize);
+		isc_refcount_increment0(&recvcount);
+		debug("recvcount=%" PRIuFAST32,
+		      isc_refcount_current(&recvcount));
+		isc_nm_read(handle, recv_done, query);
+		goto keep_query;
+	}
+
 	dns_message_create(mctx, DNS_MESSAGE_INTENTPARSE, &msg);
 
 	if (tsigkey != NULL) {
@@ -4187,9 +4314,12 @@ recv_done(isc_nmhandle_t *handle, isc_result_t eresult, isc_region_t *region,
 	result = dns_message_parse(msg, &b, parseflags);
 
 	/*
-	 * RAW UDP fragmentation (see dns/raw.h): cache the fragment, ask for
-	 * the next one on the same socket, and once all of them are here
-	 * parse the reassembled reply instead of the fragment.
+	 * RAW UDP fragmentation (see dns/raw.h): cache the fragment; when
+	 * the first fragment of an answer arrives, request every fragment
+	 * not yet requested in one burst on the same socket (fragments
+	 * 1..raw_prefetched already went out with the query, 1-RTT); once
+	 * all of them are here parse the reassembled reply instead of the
+	 * fragment.  Fragments may arrive in any order.
 	 */
 	if (!l->tcp_mode && raw_is_fragment(region)) {
 		unsigned frag_nr = 0, nr_fragments = 0;
@@ -4198,6 +4328,7 @@ recv_done(isc_nmhandle_t *handle, isc_result_t eresult, isc_region_t *region,
 		isc_buffer_t frag_buf;
 		fragment_cache_entry_t *entry = NULL;
 		isc_result_t rres;
+		bool first;
 
 		(void)raw_parse_envelope(region, &frag_nr, &nr_fragments, NULL);
 		fcache_create_key(id, local_addr_buf, key, &keysize);
@@ -4205,10 +4336,8 @@ recv_done(isc_nmhandle_t *handle, isc_result_t eresult, isc_region_t *region,
 		isc_buffer_add(&frag_buf, region->length);
 		debug("RAW fragment %u of %u", frag_nr, nr_fragments);
 
-		if (frag_nr == 0) {
-			(void)fcache_add(dig_fcache, key, keysize,
-					 nr_fragments);
-		}
+		first = (fcache_add(dig_fcache, key, keysize, nr_fragments) ==
+			 ISC_R_SUCCESS);
 		rres = fcache_add_fragment_buffer(dig_fcache, key, keysize,
 						  frag_nr, &frag_buf);
 		if (rres != ISC_R_SUCCESS) {
@@ -4219,37 +4348,8 @@ recv_done(isc_nmhandle_t *handle, isc_result_t eresult, isc_region_t *region,
 
 		rres = fcache_take_complete(dig_fcache, key, keysize, &entry);
 		if (rres == ISC_R_INPROGRESS) {
-			isc_buffer_t *request = NULL;
-			raw_fragment_send_ctx_t *ctx = NULL;
-			isc_region_t rr;
-			unsigned next = frag_nr + 1;
-
-			if (next >= nr_fragments) {
-				dighost_warning("RAW fragments missing after "
-						"fragment %u of %u",
-						frag_nr, nr_fragments);
-				goto cancel_lookup;
-			}
-			rres = create_fragment_query_opt(mctx, &frag_buf, next,
-							 nr_fragments,
-							 &request);
-			if (rres != ISC_R_SUCCESS) {
-				dighost_warning("could not build RAW request "
-						"for fragment %u: %s",
-						next, isc_result_totext(rres));
-				goto cancel_lookup;
-			}
-			debug("RAW: requesting fragment %u of %u", next,
-			      nr_fragments);
-
-			ctx = isc_mem_get(mctx, sizeof(*ctx));
-			*ctx = (raw_fragment_send_ctx_t){ .buffer = request };
-			query_attach(query, &ctx->query);
-			isc_nmhandle_attach(query->handle, &ctx->sendhandle);
-			isc_buffer_usedregion(request, &rr);
-
 			/*
-			 * Register the next read before sending the request:
+			 * Register the next read before sending requests:
 			 * the server may answer immediately.
 			 */
 			isc_refcount_increment0(&recvcount);
@@ -4257,11 +4357,28 @@ recv_done(isc_nmhandle_t *handle, isc_result_t eresult, isc_region_t *region,
 			      isc_refcount_current(&recvcount));
 			isc_nm_read(handle, recv_done, query);
 
-			isc_refcount_increment0(&sendcount);
-			debug("sendcount=%" PRIuFAST32,
-			      isc_refcount_current(&sendcount));
-			isc_nm_send(query->handle, &rr, raw_fragment_send_done,
-				    ctx);
+			for (unsigned i = 1 + query->raw_prefetched;
+			     first && i < nr_fragments; i++)
+			{
+				isc_buffer_t *request = NULL;
+
+				rres = raw_build_request(mctx, region, i,
+							 nr_fragments,
+							 &request);
+				if (rres != ISC_R_SUCCESS) {
+					dighost_warning("could not build RAW "
+							"request for fragment "
+							"%u: %s",
+							i,
+							isc_result_totext(rres));
+					break;
+				}
+				debug("RAW: requesting fragment %u of %u", i,
+				      nr_fragments);
+				raw_send_request(query, &request);
+			}
+			query->raw_nr = nr_fragments;
+			raw_rerequest_missed(query, key, keysize);
 			goto keep_query;
 		} else if (rres == ISC_R_SUCCESS) {
 			isc_buffer_t *full = NULL;

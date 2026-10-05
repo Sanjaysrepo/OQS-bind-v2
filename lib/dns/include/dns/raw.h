@@ -72,16 +72,19 @@
  * 1-RTT mode: when the resolver sends a query that may get a fragmented
  * answer, it sends speculative OPCODE 7 requests for fragments 1..n-1
  * together with the query, so the complete answer arrives in a single
- * round trip.  n comes from the per-server fragment history kept by the
- * dispatch manager and is capped by this bound (which is also the
- * default for servers we have no history with); the cap keeps the
- * request burst small (DoS/overhead protection).  If the answer needs
- * more fragments than estimated, the remainder is requested when
+ * round trip.  n is the number of fragments the last fragmented answer
+ * from that server needed - for the same query type if there is one,
+ * else for any type (per-server history kept by the dispatch manager) -
+ * and this default for servers we have no history with.  The default is
+ * also the lower bound: history only ever raises the estimate.  If the answer
+ * needs more fragments than estimated, the remainder is requested when
  * fragment 0 arrives (two-step); if it needs fewer - or the server does
  * not support fragmentation at all - the server answers the speculative
  * requests with OPCODE 7 error echoes, which the dispatch ignores.
+ * Requests are ~50 bytes and a server only ever answers fragments it
+ * has, so a generous estimate costs little; a low one costs a round trip.
  */
-#define RAW_1RTT_MAX_PREFETCH 4
+#define RAW_1RTT_DEFAULT_ESTIMATE 4
 
 /*
  * Server side.  Renders 'msg' (which must be in render intent and not yet
@@ -128,6 +131,45 @@ raw_is_fragment(const isc_region_t *datagram);
  */
 bool
 raw_prefetch_candidate(const isc_region_t *query);
+
+/*
+ * 1-RTT race: a speculative request can reach the server before the
+ * answer exists (a recursive server still resolving, or a slow render),
+ * miss the server's fragment cache and come back as an OPCODE 7 echo.
+ * Requests 1..'prefetched' were sent; the answer has 'nr_fragments'
+ * fragments, so the requests beyond the answer are expected to echo.
+ * Any echo on top of those means a request for a fragment the answer
+ * does have was lost to the race and must be sent again.
+ */
+static inline bool
+raw_prefetch_missed(unsigned prefetched, unsigned nr_fragments,
+		    unsigned echoes) {
+	unsigned beyond = (prefetched >= nr_fragments)
+				  ? prefetched - nr_fragments + 1
+				  : 0;
+	return (echoes > beyond);
+}
+
+/* the QTYPE of the first question of a wire message; 0 if there is none */
+unsigned
+raw_question_type(const isc_region_t *msg);
+
+/*
+ * Builds the OPCODE 7 request for fragment 'frag_nr' of 'nr_fragments'
+ * straight from the wire bytes of 'msg' - the original query or any RAW
+ * fragment of the answer (both start with the same id and question).
+ * Byte-level, no message parsing or rendering: cheap enough to build a
+ * whole 1-RTT burst before the query leaves, so the query and its
+ * speculative requests go out back to back.  The result is identical to
+ * create_fragment_query_opt()'s.  *outp is allocated and owned by the
+ * caller.
+ *
+ * Returns ISC_R_SUCCESS, ISC_R_FAILURE (bad numbers or question) or
+ * ISC_R_UNEXPECTEDEND (short message).
+ */
+isc_result_t
+raw_build_request(isc_mem_t *mctx, const isc_region_t *msg, unsigned frag_nr,
+		  unsigned nr_fragments, isc_buffer_t **outp);
 
 /*
  * Reassembles a complete cache entry (see fcache_take_complete()) into a

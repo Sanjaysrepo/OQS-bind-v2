@@ -205,6 +205,86 @@ raw_prefetch_candidate(const isc_region_t *query) {
 	return (false);
 }
 
+unsigned
+raw_question_type(const isc_region_t *msg) {
+	REQUIRE(msg != NULL);
+
+	unsigned off = DNS_HEADER_SIZE;
+
+	if (msg->length < DNS_HEADER_SIZE ||
+	    ((msg->base[4] << 8) | msg->base[5]) == 0 ||
+	    skip_name(msg->base, msg->length, &off) != ISC_R_SUCCESS ||
+	    off + QUESTION_FIXED_SIZE > msg->length)
+	{
+		return (0);
+	}
+	return ((msg->base[off] << 8) | msg->base[off + 1]);
+}
+
+isc_result_t
+raw_build_request(isc_mem_t *mctx, const isc_region_t *msg, unsigned frag_nr,
+		  unsigned nr_fragments, isc_buffer_t **outp) {
+	REQUIRE(msg != NULL);
+	REQUIRE(outp != NULL && *outp == NULL);
+
+	const unsigned char *p = msg->base;
+	unsigned len = msg->length;
+	unsigned qend = DNS_HEADER_SIZE;
+
+	if (nr_fragments == 0 || nr_fragments > RAW_MAX_FRAGMENTS ||
+	    frag_nr >= nr_fragments)
+	{
+		return (ISC_R_FAILURE);
+	}
+	if (len < DNS_HEADER_SIZE || ((p[4] << 8) | p[5]) == 0) {
+		return (ISC_R_UNEXPECTEDEND);
+	}
+	/* the first question; its name cannot be compressed (nothing before it) */
+	isc_result_t result = skip_name(p, len, &qend);
+	if (result != ISC_R_SUCCESS) {
+		return (result);
+	}
+	qend += QUESTION_FIXED_SIZE;
+	if (qend > len) {
+		return (ISC_R_UNEXPECTEDEND);
+	}
+	for (unsigned i = DNS_HEADER_SIZE; i < qend - QUESTION_FIXED_SIZE;
+	     i += 1 + p[i])
+	{
+		if ((p[i] & 0xC0) != 0) {
+			return (ISC_R_FAILURE);
+		}
+	}
+
+	/* header + question + OPT (11) + option 22 (4 + 2) */
+	isc_buffer_t *b = NULL;
+	isc_buffer_allocate(mctx, &b, qend + 11 + 6);
+
+	isc_buffer_putuint8(b, p[0]); /* id */
+	isc_buffer_putuint8(b, p[1]);
+	isc_buffer_putuint8(b, RAW_OPCODE << 3); /* QR 0, OPCODE 7, no RD */
+	isc_buffer_putuint8(b, 0);
+	isc_buffer_putuint16(b, 1); /* QDCOUNT */
+	isc_buffer_putuint16(b, 0); /* ANCOUNT */
+	isc_buffer_putuint16(b, 0); /* NSCOUNT */
+	isc_buffer_putuint16(b, 1); /* ARCOUNT: the OPT record */
+	isc_buffer_putmem(b, p + DNS_HEADER_SIZE, qend - DNS_HEADER_SIZE);
+
+	isc_buffer_putuint8(b, 0); /* OPT owner: root */
+	isc_buffer_putuint16(b, dns_rdatatype_opt);
+	isc_buffer_putuint16(b, RAW_DEFAULT_MAX_UDP_SIZE); /* class: UDP size */
+	isc_buffer_putuint8(b, 0);			   /* extended RCODE */
+	isc_buffer_putuint8(b, 0);			   /* EDNS version */
+	isc_buffer_putuint16(b, DNS_MESSAGEEXTFLAG_DO);
+	isc_buffer_putuint16(b, 6); /* RDLENGTH */
+	isc_buffer_putuint16(b, RAW_OPT_OPTION);
+	isc_buffer_putuint16(b, 2);
+	isc_buffer_putuint16(b, (uint16_t)((frag_nr << 10) | (nr_fragments << 4)));
+
+	*outp = b;
+	return (ISC_R_SUCCESS);
+}
+
 /*
  * Renders the whole message (with 'opt' attached) into a fresh buffer and
  * then resets the message so that it can be rendered again by the caller.

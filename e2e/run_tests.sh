@@ -138,7 +138,7 @@ if [ -s "$PCAP" ]; then
 		check "pcap: RAW fragments and requests seen" $? "frags=$frags reqs=$reqs"
 		rtt=$(python3 tools/check1rtt.py "$OUT/pcap.txt" 2>/dev/null || python tools/check1rtt.py "$OUT/pcap.txt")
 		echo "    $rtt"
-		grep -qE "1-RTT \(speculative requests\): [1-9]" <<<"$rtt"
+		grep -qE "1-RTT \(all requests sent with the query\): [1-9]" <<<"$rtt"
 		check "pcap: 1-RTT speculative requests observed" $? "$rtt"
 	fi
 else

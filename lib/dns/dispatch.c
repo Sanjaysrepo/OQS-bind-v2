@@ -119,6 +119,9 @@ struct dns_dispentry {
 	void *arg;
 	bool reading;
 	uint8_t raw_prefetched; /*%< RAW 1-RTT: requests sent with the query */
+	uint8_t raw_nr;		/*%< RAW: fragments in the answer, 0 = unknown */
+	uint8_t raw_echoes;	/*%< RAW 1-RTT: OPCODE 7 echoes received */
+	bool raw_rerequested;	/*%< RAW 1-RTT: lost requests sent again */
 	isc_result_t result;
 	ISC_LINK(dns_dispentry_t) link;
 	ISC_LINK(dns_dispentry_t) alink;
@@ -241,9 +244,11 @@ tcp_dispatch_getnext(dns_dispatch_t *disp, dns_dispentry_t *resp,
 static void
 udp_dispatch_getnext(dns_dispentry_t *resp, int32_t timeout);
 static unsigned
-fraghist_get(dns_dispatchmgr_t *mgr, const isc_sockaddr_t *peer);
+fraghist_get(dns_dispatchmgr_t *mgr, const isc_sockaddr_t *peer,
+	     unsigned qtype);
 static void
-fraghist_set(dns_dispatchmgr_t *mgr, const isc_sockaddr_t *peer, unsigned n);
+fraghist_set(dns_dispatchmgr_t *mgr, const isc_sockaddr_t *peer,
+	     unsigned qtype, unsigned n);
 
 #define LVL(x) ISC_LOG_DEBUG(x)
 
@@ -533,6 +538,57 @@ dispentry_runtime(dns_dispentry_t *resp, const isc_time_t *now) {
 }
 
 /*
+ * RAW 1-RTT: if speculative requests were lost to the race with the
+ * answer (see raw_prefetch_missed()), request every fragment among them
+ * that has not arrived yet, once.  Needs one fragment of the answer in
+ * the cache to know its size and to build the requests from.
+ */
+static void
+raw_rerequest_missed(dns_dispentry_t *resp, const unsigned char *key,
+		     unsigned keysize) {
+	fcache_t *fcache = resp->disp->mgr->fcache;
+	unsigned nr = resp->raw_nr;
+	isc_buffer_t *have = NULL;
+	isc_region_t r;
+	unsigned sent = 0;
+
+	if (resp->raw_rerequested || nr == 0 ||
+	    !raw_prefetch_missed(resp->raw_prefetched, nr, resp->raw_echoes))
+	{
+		return;
+	}
+	resp->raw_rerequested = true;
+
+	for (unsigned j = 0; j < nr && have == NULL; j++) {
+		(void)fcache_get_fragment(fcache, key, keysize, j, &have);
+	}
+	if (have == NULL) {
+		return;
+	}
+	isc_buffer_usedregion(have, &r);
+
+	for (unsigned i = 1; i <= resp->raw_prefetched && i < nr; i++) {
+		isc_buffer_t *present = NULL, *req = NULL;
+		if (fcache_get_fragment(fcache, key, keysize, i, &present) ==
+		    ISC_R_SUCCESS)
+		{
+			continue;
+		}
+		if (raw_build_request(resp->disp->mgr->mctx, &r, i, nr,
+				      &req) != ISC_R_SUCCESS)
+		{
+			break;
+		}
+		dns_dispatch_send_fragment(resp, &req);
+		sent++;
+	}
+	dispentry_log(resp, LVL(90),
+		      "RAW 1-RTT: %u speculative requests reached the server "
+		      "before the answer, requested again",
+		      sent);
+}
+
+/*
  * General flow:
  *
  * If I/O result == CANCELED or error, free the buffer.
@@ -817,9 +873,9 @@ udp_recv(isc_nmhandle_t *handle, isc_result_t eresult, isc_region_t *region,
 			     i < nr_fragments; i++)
 			{
 				isc_buffer_t *qbuf = NULL;
-				result = create_fragment_query_opt(
-					disp->mgr->mctx, &frag_buf, i,
-					nr_fragments, &qbuf);
+				result = raw_build_request(disp->mgr->mctx,
+							   region, i,
+							   nr_fragments, &qbuf);
 				if (result != ISC_R_SUCCESS) {
 					dispentry_log(resp, LVL(90),
 						      "could not build RAW "
@@ -831,6 +887,8 @@ udp_recv(isc_nmhandle_t *handle, isc_result_t eresult, isc_region_t *region,
 				dns_dispatch_send_fragment(resp, &qbuf);
 			}
 		}
+		resp->raw_nr = nr_fragments;
+		raw_rerequest_missed(resp, key, keysize);
 		result = fcache_take_complete(fcache, key, keysize, &entry);
 		if (result == ISC_R_SUCCESS) {
 			result = raw_reassemble(disp->mgr->mctx, entry,
@@ -844,6 +902,7 @@ udp_recv(isc_nmhandle_t *handle, isc_result_t eresult, isc_region_t *region,
 					      "RAW: reassembled %u bytes",
 					      region->length);
 				fraghist_set(disp->mgr, &resp->peer,
+					     raw_question_type(region),
 					     nr_fragments);
 				goto done;
 			}
@@ -860,11 +919,24 @@ udp_recv(isc_nmhandle_t *handle, isc_result_t eresult, isc_region_t *region,
 		 * An OPCODE 7 response that is not a RAW fragment: a server
 		 * without fragmentation support (NOTIMP) or an answer that
 		 * needed no fragmentation (FORMERR) echoing a speculative
-		 * 1-RTT request.  Not the answer - keep waiting for it.
+		 * 1-RTT request.  Not the answer - keep waiting for it.  It
+		 * may also be a request that overtook the answer; counting
+		 * the echoes tells (see raw_rerequest_missed()).
 		 */
+		char to_addr_buf[ISC_SOCKADDR_FORMATSIZE];
+		unsigned char key[69];
+		unsigned keysize = sizeof(key);
+
 		dispentry_log(resp, LVL(90),
 			      "ignoring OPCODE 7 echo of a speculative "
 			      "fragment request");
+		if (resp->raw_echoes < UINT8_MAX) {
+			resp->raw_echoes++;
+		}
+		isc_sockaddr_format(&resp->local, to_addr_buf,
+				    sizeof(to_addr_buf));
+		fcache_create_key(id, to_addr_buf, key, &keysize);
+		raw_rerequest_missed(resp, key, keysize);
 		goto next;
 	}
 
@@ -1250,59 +1322,101 @@ dns_dispatchmgr_setudpfragmentation(dns_dispatchmgr_t *mgr, uint8_t udp_fragment
 /*
  * RAW 1-RTT: remember how many fragments the last fragmented reply of a
  * server needed, so the next query to it is sent together with that many
- * speculative fragment requests (see dns_dispatch_send()).
+ * speculative fragment requests (see dns_dispatch_send()).  Kept per
+ * server and query type ("addr#port/type": a server's DNSKEY answers are
+ * larger than its A answers) and per server ("addr#port", the estimate
+ * for a type not seen yet).
  */
+#define FRAGHIST_KEYSIZE (ISC_SOCKADDR_FORMATSIZE + 8)
+
 typedef struct fraghist_ent {
-	char key[ISC_SOCKADDR_FORMATSIZE];
+	char key[FRAGHIST_KEYSIZE];
 	unsigned keysize;
 	uint8_t nr_fragments;
 } fraghist_ent_t;
 
+static void
+fraghist_key(const isc_sockaddr_t *peer, unsigned qtype, char *key) {
+	isc_sockaddr_format(peer, key, FRAGHIST_KEYSIZE);
+	if (qtype != 0) {
+		size_t l = strlen(key);
+		snprintf(key + l, FRAGHIST_KEYSIZE - l, "/%u", qtype);
+	}
+}
+
+/* caller holds fraghist_lock */
 static unsigned
-fraghist_get(dns_dispatchmgr_t *mgr, const isc_sockaddr_t *peer) {
-	char key[ISC_SOCKADDR_FORMATSIZE];
+fraghist_find(dns_dispatchmgr_t *mgr, const char *key) {
 	fraghist_ent_t *ent = NULL;
+
+	if (isc_ht_find(mgr->fraghist, (const unsigned char *)key, strlen(key),
+			(void **)&ent) == ISC_R_SUCCESS)
+	{
+		return (ent->nr_fragments);
+	}
+	return (0);
+}
+
+/* caller holds fraghist_lock */
+static void
+fraghist_put(dns_dispatchmgr_t *mgr, const char *key, unsigned n) {
+	fraghist_ent_t *ent = NULL;
+
+	if (isc_ht_find(mgr->fraghist, (const unsigned char *)key, strlen(key),
+			(void **)&ent) == ISC_R_SUCCESS)
+	{
+		ent->nr_fragments = n;
+		return;
+	}
+	ent = isc_mem_get(mgr->mctx, sizeof(*ent));
+	*ent = (fraghist_ent_t){ .nr_fragments = n };
+	snprintf(ent->key, sizeof(ent->key), "%s", key);
+	ent->keysize = strlen(ent->key);
+	if (isc_ht_add(mgr->fraghist, (unsigned char *)ent->key, ent->keysize,
+		       ent) != ISC_R_SUCCESS)
+	{
+		isc_mem_put(mgr->mctx, ent, sizeof(*ent));
+	}
+}
+
+/* 0 = no history with this server */
+static unsigned
+fraghist_get(dns_dispatchmgr_t *mgr, const isc_sockaddr_t *peer,
+	     unsigned qtype) {
+	char key[FRAGHIST_KEYSIZE];
 	unsigned n = 0;
 
 	if (mgr->fraghist == NULL) {
 		return (0);
 	}
-	isc_sockaddr_format(peer, key, sizeof(key));
 	LOCK(&mgr->fraghist_lock);
-	if (isc_ht_find(mgr->fraghist, (unsigned char *)key, strlen(key),
-			(void **)&ent) == ISC_R_SUCCESS)
-	{
-		n = ent->nr_fragments;
+	if (qtype != 0) {
+		fraghist_key(peer, qtype, key);
+		n = fraghist_find(mgr, key);
+	}
+	if (n == 0) {
+		fraghist_key(peer, 0, key);
+		n = fraghist_find(mgr, key);
 	}
 	UNLOCK(&mgr->fraghist_lock);
 	return (n);
 }
 
 static void
-fraghist_set(dns_dispatchmgr_t *mgr, const isc_sockaddr_t *peer, unsigned n) {
-	char key[ISC_SOCKADDR_FORMATSIZE];
-	fraghist_ent_t *ent = NULL;
+fraghist_set(dns_dispatchmgr_t *mgr, const isc_sockaddr_t *peer,
+	     unsigned qtype, unsigned n) {
+	char key[FRAGHIST_KEYSIZE];
 
 	if (mgr->fraghist == NULL || n == 0 || n > RAW_MAX_FRAGMENTS) {
 		return;
 	}
-	isc_sockaddr_format(peer, key, sizeof(key));
 	LOCK(&mgr->fraghist_lock);
-	if (isc_ht_find(mgr->fraghist, (unsigned char *)key, strlen(key),
-			(void **)&ent) == ISC_R_SUCCESS)
-	{
-		ent->nr_fragments = n;
-	} else {
-		ent = isc_mem_get(mgr->mctx, sizeof(*ent));
-		*ent = (fraghist_ent_t){ .nr_fragments = n };
-		snprintf(ent->key, sizeof(ent->key), "%s", key);
-		ent->keysize = strlen(ent->key);
-		if (isc_ht_add(mgr->fraghist, (unsigned char *)ent->key,
-			       ent->keysize, ent) != ISC_R_SUCCESS)
-		{
-			isc_mem_put(mgr->mctx, ent, sizeof(*ent));
-		}
+	if (qtype != 0) {
+		fraghist_key(peer, qtype, key);
+		fraghist_put(mgr, key, n);
 	}
+	fraghist_key(peer, 0, key);
+	fraghist_put(mgr, key, n);
 	UNLOCK(&mgr->fraghist_lock);
 }
 
@@ -2630,49 +2744,66 @@ dns_dispatch_send(dns_dispentry_t *resp, isc_region_t *r) {
 	default:
 		UNREACHABLE();
 	}
-	dns_dispentry_ref(resp); /* DISPENTRY007 */
-	isc_nm_send(sendhandle, r, send_done, resp);
-
 	/*
 	 * RAW 1-RTT: send speculative fragment requests together with the
 	 * query, so a fragmented answer arrives in a single round trip.
-	 * How many is taken from the per-server history (capped); with no
-	 * history the default cap is used.  A server that does not
+	 * How many is taken from the fragment history with this server
+	 * (same query type first, see fraghist_get()); with no history the
+	 * default estimate is used.  A server that does not
 	 * fragment - or an answer that needs no fragmentation - answers
 	 * them with OPCODE 7 error echoes, which udp_recv() ignores; an
 	 * answer with more fragments than estimated gets the remainder
 	 * requested when fragment 0 arrives.
+	 *
+	 * The requests are built before the query is sent, so that nothing
+	 * stands between the query and its requests on the wire: if they
+	 * trailed the query, fragment 0 could arrive first and the
+	 * exchange would degrade to two round trips.
 	 */
+	isc_buffer_t *prefetch[RAW_MAX_FRAGMENTS] = { NULL };
+	unsigned nprefetch = 0;
+
 	resp->raw_prefetched = 0;
+	resp->raw_nr = 0;
+	resp->raw_echoes = 0;
+	resp->raw_rerequested = false;
 	if (disp->socktype == isc_socktype_udp &&
 	    disp->mgr->udp_fragmentation_mode == 2 &&
 	    raw_prefetch_candidate(r))
 	{
-		unsigned n = fraghist_get(disp->mgr, &resp->peer);
-		isc_buffer_t qbuf;
+		unsigned n = fraghist_get(disp->mgr, &resp->peer,
+					  raw_question_type(r));
 
-		if (n == 0 || n > RAW_1RTT_MAX_PREFETCH) {
-			n = RAW_1RTT_MAX_PREFETCH;
+		/*
+		 * The default is also the floor: requests the answer turns
+		 * out not to need cost one small echo each, a request
+		 * missing from the burst costs a round trip.
+		 */
+		if (n < RAW_1RTT_DEFAULT_ESTIMATE || n > RAW_MAX_FRAGMENTS) {
+			n = RAW_1RTT_DEFAULT_ESTIMATE;
 		}
-		isc_buffer_init(&qbuf, r->base, r->length);
-		isc_buffer_add(&qbuf, r->length);
 		for (unsigned i = 1; i < n; i++) {
-			isc_buffer_t *req = NULL;
-			if (create_fragment_query_opt(disp->mgr->mctx, &qbuf,
-						      i, n,
-						      &req) != ISC_R_SUCCESS)
+			if (raw_build_request(disp->mgr->mctx, r, i, n,
+					      &prefetch[nprefetch]) !=
+			    ISC_R_SUCCESS)
 			{
 				break;
 			}
-			dns_dispatch_send_fragment(resp, &req);
-			resp->raw_prefetched = i;
+			nprefetch++;
 		}
-		if (resp->raw_prefetched > 0) {
-			dispentry_log(resp, LVL(90),
-				      "RAW 1-RTT: sent %u speculative "
-				      "fragment requests",
-				      resp->raw_prefetched);
-		}
+	}
+
+	dns_dispentry_ref(resp); /* DISPENTRY007 */
+	isc_nm_send(sendhandle, r, send_done, resp);
+
+	for (unsigned i = 0; i < nprefetch; i++) {
+		dns_dispatch_send_fragment(resp, &prefetch[i]);
+	}
+	resp->raw_prefetched = nprefetch;
+	if (nprefetch > 0) {
+		dispentry_log(resp, LVL(90),
+			      "RAW 1-RTT: sent %u speculative fragment requests",
+			      nprefetch);
 	}
 }
 

@@ -4455,10 +4455,15 @@ Tuning
       support RAW see RCODE 12 and treat the reply as an error.  This is
       the recommended mode.  A resolver in RAW mode uses *1-RTT mode*:
       it sends speculative fragment requests together with any query
-      that may get a fragmented answer (per-server history, at most 4),
-      so the complete answer arrives in a single round trip; wrong
-      estimates and servers without fragmentation support are handled
-      transparently.
+      that may get a fragmented answer - as many as the last fragmented
+      answer from that server needed (per server and query type, at
+      least 4 and 4 for unknown servers) - so the complete answer
+      arrives in a single round trip.  Low estimates are topped up when
+      fragment 0 arrives, requests the answer does not need are answered
+      with ignored error echoes, requests that reach a server before
+      its answer exists (e.g. a recursive server still resolving) are
+      sent again, and servers without fragmentation support are handled
+      transparently.  :iscman:`dig` uses the same scheme.
 
    ``QBF``
       The earlier scheme.  Each fragment is a normal reply in which only

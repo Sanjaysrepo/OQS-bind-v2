@@ -220,6 +220,10 @@ struct dig_query {
 	isc_time_t time_recv;
 	uint64_t byte_count;
 	isc_timer_t *timer;
+	unsigned int raw_prefetched; /* RAW 1-RTT: requests sent with query */
+	unsigned int raw_nr;	     /* RAW: fragments in answer, 0 = unknown */
+	unsigned int raw_echoes;     /* RAW 1-RTT: OPCODE 7 echoes received */
+	bool raw_rerequested;	     /* RAW 1-RTT: lost requests sent again */
 };
 
 struct dig_server {

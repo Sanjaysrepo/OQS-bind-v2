@@ -1337,16 +1337,26 @@ isc__nm_start_reading(isc_nmsocket_t *sock) {
 	isc_result_t result = ISC_R_SUCCESS;
 	int r;
 
-	if (uv_is_active(&sock->uv_handle.handle)) {
-		return (ISC_R_SUCCESS);
-	}
-
 	switch (sock->type) {
 	case isc_nm_udpsocket:
+		/*
+		 * Not uv_is_active(): a UDP handle with sends still queued
+		 * stays active after uv_udp_recv_stop(), so that check would
+		 * skip restarting the receiver and every datagram after it
+		 * would be lost (seen with a burst of fragment requests in
+		 * flight).  uv_udp_recv_start() itself reports a receiver
+		 * that is already running.
+		 */
 		r = uv_udp_recv_start(&sock->uv_handle.udp, isc__nm_alloc_cb,
 				      isc__nm_udp_read_cb);
+		if (r == UV_EALREADY) {
+			r = 0;
+		}
 		break;
 	case isc_nm_tcpsocket:
+		if (uv_is_active(&sock->uv_handle.handle)) {
+			return (ISC_R_SUCCESS);
+		}
 		r = uv_read_start(&sock->uv_handle.stream, isc__nm_alloc_cb,
 				  isc__nm_tcp_read_cb);
 		break;

@@ -6,8 +6,10 @@ request n/N, fragment reply n/N).  Makes two properties easy to see:
 
   * every query transaction uses its own client port, and the fragment
     requests reuse that port (so the replies reach the right socket);
-  * all remaining fragments are requested in one burst right after
-    fragment 0 arrives, i.e. the whole exchange costs one extra RTT.
+  * 1-RTT mode: the speculative fragment requests leave together with
+    the query, before any reply, so the whole answer arrives in one
+    round trip (a "=> 1 round trip" verdict is printed per exchange).
+    Requests the answer did not need come back as OPCODE 7 echoes.
 
 Usage: txtimeline.py <pcapdump-output.txt | file.pcap> [max_transactions]
 """
@@ -67,10 +69,11 @@ def main():
 
     shown = 0
     for txid, ps in sorted(tx.items(), key=lambda kv: kv[1][0]["t"]):
-        if not any(p.get("frag") for p in ps) or len(ps) < 6:
+        if not any(p.get("frag") for p in ps):
             continue
         print(f"--- transaction id=0x{txid}  query: {ps[0].get('q', '?')} ---")
         t0 = ps[0]["t"]
+        first_reply = None
         for p in ps:
             if p["qr"] == 0 and p["op"] == 0 and not p.get("frag"):
                 kind = "QUERY"
@@ -78,10 +81,30 @@ def main():
                 kind = "FRAG REQUEST %d/%d" % p.get("frag", (0, 0))
             elif p.get("frag"):
                 kind = "FRAG REPLY   %d/%d" % p["frag"]
+            elif p["op"] == 7:
+                kind = "ECHO (speculative request not needed)"
             else:
-                kind = "REPLY"
+                kind = "ANSWER (fits in one datagram)"
+            if p["qr"] == 1 and first_reply is None:
+                first_reply = p["t"]
             print(f"  t=+{(p['t'] - t0) * 1000:6.2f} ms  "
                   f"{p['src']:>22} -> {p['dst']:<20} {kind}")
+        reqs = [p for p in ps if p["qr"] == 0 and p["op"] == 7]
+        if reqs:
+            # capture order, not timestamps (0.1 ms resolution): a request
+            # listed after a reply left after that reply had arrived
+            late, seen_reply = 0, False
+            for p in ps:
+                if p["qr"] == 1:
+                    seen_reply = True
+                elif p["op"] == 7 and seen_reply:
+                    late += 1
+            if late == 0:
+                print("  => 1 round trip: every fragment request left "
+                      "before the first reply arrived")
+            else:
+                print(f"  => more than 1 round trip: {late} request(s) sent "
+                      "after the first reply arrived")
         print()
         shown += 1
         if shown >= limit:

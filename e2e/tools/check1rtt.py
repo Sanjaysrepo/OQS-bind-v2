@@ -1,8 +1,12 @@
 """Check 1-RTT behaviour in a capture (pcapdump.py output or .pcap).
 
 For every fragmented transaction towards the authoritative server,
-checks whether the fragment requests were sent *before* the first
-fragment reply arrived (speculative / 1-RTT) or only afterwards (2-RTT).
+checks whether all fragment requests were sent *before* the first
+fragment reply arrived (speculative / 1-RTT), only some of them (the
+estimate was too low or requests left late; the rest followed the
+first reply) or none of them (2-RTT).  Only traffic with the authoritative server is
+counted - the resolver's and dig's direct queries; the dig <-> resolver
+loopback hop is skipped.
 
 Usage: check1rtt.py <pcapdump-output.txt | file.pcap>
 Exit code 0 when at least one 1-RTT transaction is present.
@@ -28,39 +32,51 @@ def load(path):
 
 
 def main():
-    tx = defaultdict(lambda: {"req": [], "frag_reply": []})
+    # per transaction: capture positions of fragment requests and replies
+    # (capture order, not timestamps: those have 0.1 ms resolution)
+    tx = defaultdict(lambda: {"req": [], "reply": [], "frag": False})
     cur = None
+    pos = 0
     for line in load(sys.argv[1]):
         m = HDR.match(line)
         if m:
-            cur = {"t": float(m[1]), "loop": "127.0.0.1" in (m[3], m[5])}
+            pos += 1
+            cur = {"pos": pos, "loop": "127.0.0.1" in (m[3], m[5])}
             continue
-        if cur is None:
+        if cur is None or cur["loop"]:
             continue
         m = IDL.match(line)
-        if m and not cur["loop"]:
-            cur.update(id=m[1], qr=int(m[2]), op=int(m[3]))
+        if m:
+            t = tx[m[1]]
+            if int(m[2]) == 0 and int(m[3]) == 7:
+                t["req"].append(cur["pos"])
+            elif int(m[2]) == 1:
+                t["reply"].append(cur["pos"])
+                cur["id"] = m[1]
             continue
-        m = OPT.search(line)
-        if m and cur and "id" in cur and not cur["loop"]:
-            t = tx[cur["id"]]
-            if cur["qr"] == 0 and cur["op"] == 7:
-                t["req"].append(cur["t"])
-            elif cur["qr"] == 1:
-                t["frag_reply"].append(cur["t"])
+        if OPT.search(line) and "id" in cur:
+            tx[cur["id"]]["frag"] = True
 
-    one_rtt = two_rtt = 0
+    one_rtt = topped_up = two_rtt = 0
     for txid, t in tx.items():
-        if not t["req"] or not t["frag_reply"]:
+        if not t["req"] or not t["frag"]:
             continue
-        # speculative: the first fragment request left before any
-        # fragment reply had arrived
-        if min(t["req"]) <= min(t["frag_reply"]):
+        first_reply = min(t["reply"])
+        if max(t["req"]) < first_reply:
+            # every request left with the query: one round trip
             one_rtt += 1
+        elif min(t["req"]) < first_reply:
+            # some requests left with the query, the rest only after the
+            # first reply (estimate too low, or requests sent late)
+            topped_up += 1
         else:
             two_rtt += 1
-    print(f"fragmented transactions with requests: {one_rtt + two_rtt}, "
-          f"1-RTT (speculative requests): {one_rtt}, 2-RTT: {two_rtt}")
+    total = one_rtt + topped_up + two_rtt
+    print(f"fragmented transactions with requests: {total}, "
+          f"1-RTT (all requests sent with the query): {one_rtt}, "
+          f"more than 1 RTT: {topped_up + two_rtt} "
+          f"({topped_up} with only part of the requests sent with the query, "
+          f"{two_rtt} with none)")
     sys.exit(0 if one_rtt > 0 else 1)
 
 
